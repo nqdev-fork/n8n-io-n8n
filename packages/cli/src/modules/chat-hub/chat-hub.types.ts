@@ -41,13 +41,20 @@ export interface EditMessagePayload extends BaseMessagePayload {
 	editId: ChatMessageId;
 	messageId: ChatMessageId;
 	message: string;
+	newAttachments: ChatAttachment[];
+	keepAttachmentIndices: number[];
 }
+
+// From @langchain/core
+export type ContentBlock =
+	| { type: 'text'; text: string }
+	| { type: 'image_url'; image_url: string };
 
 // From packages/@n8n/nodes-langchain/nodes/memory/MemoryManager/MemoryManager.node.ts
 export type MessageRole = 'ai' | 'system' | 'user';
 export interface MessageRecord {
 	type: MessageRole;
-	message: string;
+	message: string | ContentBlock[];
 	hideFromUI: boolean;
 }
 

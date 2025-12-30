@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue';
+import { ref, computed, onMounted, onBeforeUnmount, nextTick } from 'vue';
 import { useRoute } from 'vue-router';
 import { useToast } from '@/app/composables/useToast';
 import type { ITimeoutHMS, IWorkflowSettings, IWorkflowShortResponse } from '@/Interface';
@@ -7,12 +7,19 @@ import type { WorkflowDataUpdate } from '@n8n/rest-api-client/api/workflows';
 import Modal from '@/app/components/Modal.vue';
 import {
 	EnterpriseEditionFeature,
-	PLACEHOLDER_EMPTY_WORKFLOW_ID,
 	WORKFLOW_SETTINGS_MODAL_KEY,
 	NODE_CREATOR_OPEN_SOURCES,
 	TIME_SAVED_NODE_TYPE,
 } from '@/app/constants';
-import { N8nButton, N8nIcon, N8nInput, N8nOption, N8nSelect, N8nTooltip } from '@n8n/design-system';
+import {
+	N8nButton,
+	N8nIcon,
+	N8nIconButton,
+	N8nInput,
+	N8nOption,
+	N8nSelect,
+	N8nTooltip,
+} from '@n8n/design-system';
 import type { WorkflowSettings } from 'n8n-workflow';
 import { deepCopy } from 'n8n-workflow';
 import { useSettingsStore } from '@/app/stores/settings.store';
@@ -31,6 +38,8 @@ import { injectWorkflowState } from '@/app/composables/useWorkflowState';
 import { useMcp } from '@/features/ai/mcpAccess/composables/useMcp';
 import { useGlobalLinkActions } from '@/app/composables/useGlobalLinkActions';
 import { useNodeCreatorStore } from '@/features/shared/nodeCreator/nodeCreator.store';
+import { useEnvFeatureFlag } from '@/features/shared/envFeatureFlag/useEnvFeatureFlag';
+import { useCredentialResolvers } from '@/features/resolvers/composables/useCredentialResolvers';
 
 import { ElCol, ElRow, ElSwitch } from 'element-plus';
 
@@ -42,6 +51,7 @@ const modalBus = createEventBus();
 const telemetry = useTelemetry();
 const { isEligibleForMcpAccess, trackMcpAccessEnabledForWorkflow, mcpTriggerMap } = useMcp();
 const { registerCustomAction, unregisterCustomAction } = useGlobalLinkActions();
+const { check: checkEnvFeatureFlag } = useEnvFeatureFlag();
 
 const rootStore = useRootStore();
 const settingsStore = useSettingsStore();
@@ -64,6 +74,14 @@ const executionOrderOptions = ref<Array<{ key: string; value: string }>>([
 const timezones = ref<Array<{ key: string; value: string }>>([]);
 const workflowSettings = ref<IWorkflowSettings>({} as IWorkflowSettings);
 const workflows = ref<IWorkflowShortResponse[]>([]);
+const credentialResolverSelectRef = ref<InstanceType<typeof N8nSelect> | null>(null);
+
+const {
+	resolvers: credentialResolvers,
+	fetchResolvers: loadCredentialResolvers,
+	openCreateModal,
+	openEditModal,
+} = useCredentialResolvers();
 const executionTimeout = ref(0);
 const maxExecutionTimeout = ref(0);
 const timeoutHMS = ref<ITimeoutHMS>({ hours: 0, minutes: 0, seconds: 0 });
@@ -71,6 +89,7 @@ const timeoutHMS = ref<ITimeoutHMS>({ hours: 0, minutes: 0, seconds: 0 });
 const helpTexts = computed(() => ({
 	errorWorkflow: i18n.baseText('workflowSettings.helpTexts.errorWorkflow'),
 	timezone: i18n.baseText('workflowSettings.helpTexts.timezone'),
+	credentialResolver: i18n.baseText('workflowSettings.helpTexts.credentialResolver'),
 	saveDataErrorExecution: i18n.baseText('workflowSettings.helpTexts.saveDataErrorExecution'),
 	saveDataSuccessExecution: i18n.baseText('workflowSettings.helpTexts.saveDataSuccessExecution'),
 	saveExecutionProgress: i18n.baseText('workflowSettings.helpTexts.saveExecutionProgress'),
@@ -93,6 +112,9 @@ const defaultValues = ref({
 
 const isMCPEnabled = computed(
 	() => settingsStore.isModuleActive('mcp') && settingsStore.moduleSettings.mcp?.mcpAccessEnabled,
+);
+const isCredentialResolverEnabled = computed(() =>
+	checkEnvFeatureFlag.value('DYNAMIC_CREDENTIALS'),
 );
 const readOnlyEnv = computed(() => sourceControlStore.preferences.branchReadOnly);
 const workflowName = computed(() => workflowsStore.workflowName);
@@ -327,6 +349,7 @@ const loadWorkflows = async (searchTerm?: string) => {
 	const workflowsData = (await workflowsStore.searchWorkflows({
 		query: searchTerm,
 		isArchived: false,
+		triggerNodeTypes: ['n8n-nodes-base.errorTrigger'],
 	})) as IWorkflowShortResponse[];
 	workflowsData.sort((a, b) => {
 		if (a.name.toLowerCase() < b.name.toLowerCase()) {
@@ -344,6 +367,33 @@ const loadWorkflows = async (searchTerm?: string) => {
 	} as IWorkflowShortResponse);
 
 	workflows.value = workflowsData;
+};
+
+const handleCreateNewResolver = async () => {
+	// Close the dropdown first
+	credentialResolverSelectRef.value?.blur();
+	await nextTick();
+
+	openCreateModal({
+		onSave: async (resolverId: string) => {
+			await loadCredentialResolvers();
+			workflowSettings.value.credentialResolverId = resolverId;
+		},
+	});
+};
+
+const handleEditResolver = async () => {
+	if (!workflowSettings.value.credentialResolverId) return;
+
+	openEditModal(workflowSettings.value.credentialResolverId, {
+		onSave: loadCredentialResolvers,
+		onDelete: async (deletedResolverId: string) => {
+			await loadCredentialResolvers();
+			if (workflowSettings.value.credentialResolverId === deletedResolverId) {
+				workflowSettings.value.credentialResolverId = undefined;
+			}
+		},
+	});
 };
 
 const { debounce } = useDebounce();
@@ -404,10 +454,10 @@ const saveSettings = async () => {
 
 	isLoading.value = true;
 	data.versionId = workflowsStore.workflowVersionId;
+	data.expectedChecksum = workflowsStore.workflowChecksum;
 
 	try {
-		const workflowData = await workflowsStore.updateWorkflow(String(route.params.name), data);
-		workflowsStore.setWorkflowVersionId(workflowData.versionId);
+		await workflowsStore.updateWorkflow(String(route.params.name), data);
 	} catch (error) {
 		toast.showError(error, i18n.baseText('workflowSettings.showError.saveSettings3.title'));
 		isLoading.value = false;
@@ -466,7 +516,7 @@ onMounted(async () => {
 	executionTimeout.value = rootStore.executionTimeout;
 	maxExecutionTimeout.value = rootStore.maxExecutionTimeout;
 
-	if (!workflowId.value || workflowId.value === PLACEHOLDER_EMPTY_WORKFLOW_ID) {
+	if (!workflowsStore.isWorkflowSaved[workflowsStore.workflowId]) {
 		toast.showMessage({
 			title: 'No workflow active',
 			message: 'No workflow active to display settings of.',
@@ -487,7 +537,7 @@ onMounted(async () => {
 	isLoading.value = true;
 
 	try {
-		await Promise.all([
+		const promises = [
 			workflowsStore.fetchWorkflow(workflowId.value),
 			loadWorkflows(),
 			loadSaveDataErrorExecutionOptions(),
@@ -496,7 +546,13 @@ onMounted(async () => {
 			loadSaveManualOptions(),
 			loadTimezones(),
 			loadWorkflowCallerPolicyOptions(),
-		]);
+		];
+
+		if (isCredentialResolverEnabled.value) {
+			promises.push(loadCredentialResolvers());
+		}
+
+		await Promise.all(promises);
 	} catch (error) {
 		toast.showError(
 			error,
@@ -644,9 +700,75 @@ onBeforeUnmount(() => {
 								:key="item.id"
 								:label="item.name"
 								:value="item.id"
+								:disabled="item.active === false"
 							>
+								<div :class="$style.optionContent">
+									<span>{{ item.name }}</span>
+									<N8nTooltip
+										v-if="item.active === false"
+										:content="i18n.baseText('resourceLocator.workflow.inactive.tooltip')"
+										placement="top"
+									>
+										<N8nIcon icon="triangle-alert" size="small" :class="$style.inactiveIcon" />
+									</N8nTooltip>
+								</div>
 							</N8nOption>
 						</N8nSelect>
+					</ElCol>
+				</ElRow>
+				<ElRow v-if="isCredentialResolverEnabled" data-test-id="credential-resolver">
+					<ElCol :span="10" :class="$style['setting-name']">
+						{{ i18n.baseText('workflowSettings.credentialResolver') }}
+						<N8nTooltip placement="top">
+							<template #content>
+								<div v-text="helpTexts.credentialResolver"></div>
+							</template>
+							<N8nIcon icon="circle-help" />
+						</N8nTooltip>
+					</ElCol>
+					<ElCol :span="14" class="ignore-key-press-canvas">
+						<div :class="$style['credential-resolver-container']">
+							<N8nSelect
+								ref="credentialResolverSelectRef"
+								v-model="workflowSettings.credentialResolverId"
+								:placeholder="i18n.baseText('workflowSettings.credentialResolver.placeholder')"
+								filterable
+								:disabled="readOnlyEnv || !workflowPermissions.update"
+								:limit-popper-width="true"
+								data-test-id="workflow-settings-credential-resolver"
+							>
+								<N8nOption
+									v-for="resolver in credentialResolvers"
+									:key="resolver.id"
+									:label="resolver.name"
+									:value="resolver.id"
+								>
+								</N8nOption>
+								<template #footer>
+									<button
+										type="button"
+										:class="$style['create-new-button']"
+										:disabled="readOnlyEnv || !workflowPermissions.update"
+										data-test-id="workflow-settings-credential-resolver-create-new"
+										@click="handleCreateNewResolver"
+									>
+										<N8nIcon size="xsmall" icon="plus" />
+										{{ i18n.baseText('workflowSettings.credentialResolver.createNew') }}
+									</button>
+								</template>
+							</N8nSelect>
+							<N8nIconButton
+								v-if="workflowSettings.credentialResolverId"
+								icon="pen"
+								type="tertiary"
+								:text="true"
+								size="small"
+								:disabled="readOnlyEnv || !workflowPermissions.update"
+								:title="i18n.baseText('workflowSettings.credentialResolver.edit')"
+								data-test-id="workflow-settings-credential-resolver-edit"
+								@click="handleEditResolver"
+							/>
+						</div>
 					</ElCol>
 				</ElRow>
 				<div v-if="isSharingEnabled" data-test-id="workflow-caller-policy">
@@ -1230,6 +1352,56 @@ onBeforeUnmount(() => {
 
 	&:hover {
 		text-decoration: underline;
+	}
+}
+
+.optionContent {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	width: 100%;
+}
+
+.c {
+	color: var(--color--warning);
+	opacity: 0;
+	transition: opacity 0.2s ease;
+
+	:global(.el-select-dropdown__item):hover & {
+		opacity: 1;
+	}
+}
+
+.credential-resolver-container {
+	display: flex;
+	align-items: center;
+}
+
+.create-new-button {
+	display: flex;
+	width: 100%;
+	gap: var(--spacing--3xs);
+	align-items: center;
+	font-weight: var(--font-weight--bold);
+	padding: var(--spacing--xs) var(--spacing--md);
+	background-color: var(--color--background--light-2);
+	color: var(--color--text--shade-1);
+
+	border: 0;
+	border-top: var(--border);
+	box-shadow: var(--shadow--light);
+	clip-path: inset(-12px 0 0 0);
+
+	&:not([disabled]) {
+		cursor: pointer;
+		&:hover {
+			color: var(--color--primary);
+		}
+	}
+
+	&[disabled] {
+		opacity: 0.5;
+		cursor: not-allowed;
 	}
 }
 </style>
