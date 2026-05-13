@@ -9,9 +9,18 @@
  */
 
 import { validateNodeConfig, loadSchema } from './schema-validator';
+import { setupTestSchemas, teardownTestSchemas } from './test-schema-setup';
 import { parseWorkflowCode } from '../codegen/parse-workflow-code';
 import { validateWorkflow } from '../validation';
-import { setupTestSchemas, teardownTestSchemas } from './test-schema-setup';
+
+function requireSchema(nodeType: string, version: number): void {
+	if (!loadSchema(nodeType, version)) {
+		throw new Error(
+			`Schema for ${nodeType}@${version} not found. ` +
+				'Ensure the package is built (dist/types/nodes.json must exist).',
+		);
+	}
+}
 
 describe('Schema Validation Integration', () => {
 	beforeAll(setupTestSchemas, 120_000);
@@ -19,7 +28,7 @@ describe('Schema Validation Integration', () => {
 
 	describe('Resource/Operation Discriminated (MS Teams v2 - task/create)', () => {
 		// Schema: nodes/n8n-nodes-base/microsoftTeams/v2/resource_task/operation_create.schema.js
-		// Required fields: groupId, planId, bucketId (resourceLocator type), title (no displayOptions)
+		// Required fields: groupId, planId, bucketId (resourceLocator type), title (required: true, default: '')
 		// Optional field: options (no displayOptions)
 
 		it('returns no warning when all required fields are provided', () => {
@@ -38,7 +47,7 @@ describe('Schema Validation Integration', () => {
 			expect(result.errors).toEqual([]);
 		});
 
-		it('accepts config when optional title field is missing', () => {
+		it('rejects config when required title field is missing', () => {
 			const result = validateNodeConfig('n8n-nodes-base.microsoftTeams', 2, {
 				parameters: {
 					resource: 'task',
@@ -46,12 +55,10 @@ describe('Schema Validation Integration', () => {
 					groupId: { __rl: true, mode: 'id', value: 'group-123' },
 					planId: { __rl: true, mode: 'id', value: 'plan-456' },
 					bucketId: { __rl: true, mode: 'id', value: 'bucket-789' },
-					// title is optional in the schema
 				},
 			});
-			// title is optional in the generated schema, so this should pass
-			expect(result.valid).toBe(true);
-			expect(result.errors).toEqual([]);
+			expect(result.valid).toBe(false);
+			expect(result.errors.some((e) => e.message.includes('title'))).toBe(true);
 		});
 
 		it('accepts expression in groupId field', () => {
@@ -464,6 +471,10 @@ export default workflow('test-id', 'Test Workflow')
 	describe('Subnode Validation (strict mode)', () => {
 		// OpenAI v2.1 text/response only accepts tools and memory subnodes (not outputParser)
 		// Schema: nodes/n8n-nodes-langchain/openAi/v21/resource_text/operation_response.schema.js
+
+		beforeAll(() => {
+			requireSchema('@n8n/n8n-nodes-langchain.openAi', 2.1);
+		});
 
 		it('accepts valid subnodes (tools, memory) for OpenAI text/response', () => {
 			const result = validateNodeConfig('@n8n/n8n-nodes-langchain.openAi', 2.1, {

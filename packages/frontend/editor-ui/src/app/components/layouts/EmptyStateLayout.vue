@@ -7,11 +7,16 @@ import { useBannersStore } from '@/features/shared/banners/banners.store';
 import { useProjectsStore } from '@/features/collaboration/projects/projects.store';
 import { useProjectPages } from '@/features/collaboration/projects/composables/useProjectPages';
 import { useWorkflowsEmptyState } from '@/features/workflows/composables/useWorkflowsEmptyState';
+import { useSurfaceMcpEmptyState } from '@/experiments/surfaceMcpToNewCloudUsers/composables/useSurfaceMcpEmptyState';
 import { useEmptyStateBuilderPromptStore } from '@/experiments/emptyStateBuilderPrompt/stores/emptyStateBuilderPrompt.store';
+import { useCredentialsAppSelectionStore } from '@/experiments/credentialsAppSelection/stores/credentialsAppSelection.store';
 import { useReadyToRunStore } from '@/features/workflows/readyToRun/stores/readyToRun.store';
 import RecommendedTemplatesSection from '@/features/workflows/templates/recommendations/components/RecommendedTemplatesSection.vue';
 import ReadyToRunButton from '@/features/workflows/readyToRun/components/ReadyToRunButton.vue';
 import EmptyStateBuilderPrompt from '@/experiments/emptyStateBuilderPrompt/components/EmptyStateBuilderPrompt.vue';
+import AppSelectionPage from '@/experiments/credentialsAppSelection/components/AppSelectionPage.vue';
+import SurfaceMcpEmptyStateReminder from '@/experiments/surfaceMcpToNewCloudUsers/components/SurfaceMcpEmptyStateReminder.vue';
+import SurfaceMcpEmptyStateTile from '@/experiments/surfaceMcpToNewCloudUsers/components/SurfaceMcpEmptyStateTile.vue';
 
 const emit = defineEmits<{
 	'click:add': [];
@@ -23,9 +28,11 @@ const bannersStore = useBannersStore();
 const projectsStore = useProjectsStore();
 const projectPages = useProjectPages();
 const emptyStateBuilderPromptStore = useEmptyStateBuilderPromptStore();
+const credentialsAppSelectionStore = useCredentialsAppSelectionStore();
 const readyToRunStore = useReadyToRunStore();
 
 const {
+	showAppSelection,
 	showBuilderPrompt,
 	showRecommendedTemplatesInline,
 	builderHeading,
@@ -33,6 +40,13 @@ const {
 	emptyStateDescription,
 	canCreateWorkflow,
 } = useWorkflowsEmptyState();
+
+const { showTile: showMcpTile, showReminder: showMcpReminder } = useSurfaceMcpEmptyState({
+	canCreateWorkflow: computed(() => Boolean(canCreateWorkflow.value)),
+	showAppSelection: computed(() => Boolean(showAppSelection.value)),
+	showBuilderPrompt: computed(() => Boolean(showBuilderPrompt.value)),
+	showRecommendedTemplatesInline: computed(() => Boolean(showRecommendedTemplatesInline.value)),
+});
 
 const addWorkflow = () => {
 	emit('click:add');
@@ -74,6 +88,10 @@ const handleBuilderPromptSubmit = async (prompt: string) => {
 		builderParentFolderId.value,
 	);
 };
+
+const handleAppSelectionContinue = () => {
+	credentialsAppSelectionStore.dismiss();
+};
 </script>
 
 <template>
@@ -81,15 +99,21 @@ const handleBuilderPromptSubmit = async (prompt: string) => {
 		:class="[
 			$style.emptyStateLayout,
 			{
-				[$style.noTemplatesContent]: !showRecommendedTemplatesInline && !showBuilderPrompt,
-				[$style.builderLayout]: showBuilderPrompt,
+				[$style.noTemplatesContent]:
+					!showRecommendedTemplatesInline && !showBuilderPrompt && !showAppSelection,
+				[$style.builderLayout]: showBuilderPrompt || showAppSelection,
 			},
 		]"
 		:style="containerStyle"
 	>
 		<div :class="[$style.content, { [$style.builderContent]: showBuilderPrompt }]">
+			<!-- State 0: App Selection -->
+			<template v-if="showAppSelection">
+				<AppSelectionPage @continue="handleAppSelectionContinue" />
+			</template>
+
 			<!-- State 1: AI Builder -->
-			<template v-if="showBuilderPrompt">
+			<template v-else-if="showBuilderPrompt">
 				<div :class="$style.welcomeBuilder">
 					<N8nHeading tag="h1" size="xlarge">
 						{{ builderHeading }}
@@ -122,7 +146,7 @@ const handleBuilderPromptSubmit = async (prompt: string) => {
 					<div :class="$style.actionButtons">
 						<ReadyToRunButton type="secondary" size="large" />
 						<N8nButton
-							type="secondary"
+							variant="subtle"
 							icon="file"
 							size="large"
 							data-test-id="start-from-scratch-button"
@@ -143,12 +167,21 @@ const handleBuilderPromptSubmit = async (prompt: string) => {
 					<N8nText tag="p" size="large" color="text-base">
 						{{ emptyStateDescription }}
 					</N8nText>
+					<SurfaceMcpEmptyStateReminder v-if="showMcpReminder" />
 
 					<!-- Two cards or single card depending on ready-to-run availability -->
 					<div
 						v-if="canCreateWorkflow"
-						:class="[$style.actionCardsContainer, { [$style.singleCard]: !showReadyToRunCard }]"
+						:class="[
+							$style.actionCardsContainer,
+							{
+								[$style.singleCard]: !showReadyToRunCard && !showMcpTile,
+								[$style.threeCards]: showReadyToRunCard && showMcpTile,
+							},
+						]"
 					>
+						<SurfaceMcpEmptyStateTile v-if="showMcpTile" :class="$style.actionCard" />
+
 						<!-- Card 1: Try AI workflow (conditional) -->
 						<N8nCard
 							v-if="showReadyToRunCard"
@@ -264,6 +297,10 @@ const handleBuilderPromptSubmit = async (prompt: string) => {
 		grid-template-columns: 192px;
 	}
 
+	&.threeCards {
+		grid-template-columns: repeat(3, 192px);
+	}
+
 	@media (max-width: vars.$breakpoint-xs) {
 		grid-template-columns: 1fr;
 		gap: var(--spacing--md);
@@ -272,6 +309,7 @@ const handleBuilderPromptSubmit = async (prompt: string) => {
 }
 
 .actionCard {
+	position: relative;
 	width: 192px;
 	height: 230px;
 	text-align: center;

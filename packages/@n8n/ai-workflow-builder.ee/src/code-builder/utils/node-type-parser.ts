@@ -68,8 +68,12 @@ export class NodeTypeParser {
 	 * Search for nodes by name or description
 	 * Returns up to `limit` results
 	 */
-	searchNodeTypes(query: string, limit: number = 5): ParsedNodeType[] {
-		const results = this.searchEngine.searchByName(query, limit);
+	searchNodeTypes(
+		query: string,
+		limit: number = 5,
+		nodeFilter?: (nodeId: string) => boolean,
+	): ParsedNodeType[] {
+		const results = this.searchEngine.searchByName(query, limit, nodeFilter);
 
 		return results.map((result) => {
 			// Find the full node type to check if it's a trigger
@@ -104,7 +108,15 @@ export class NodeTypeParser {
 			return match ?? null;
 		}
 
-		// Otherwise, return the latest version (last in array)
-		return versions[versions.length - 1];
+		// Otherwise, return the description with the highest max version
+		return versions.reduce((latest, current) => {
+			const latestMax = Array.isArray(latest.version)
+				? Math.max(...latest.version)
+				: latest.version;
+			const currentMax = Array.isArray(current.version)
+				? Math.max(...current.version)
+				: current.version;
+			return currentMax > latestMax ? current : latest;
+		});
 	}
 }

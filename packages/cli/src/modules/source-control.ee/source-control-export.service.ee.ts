@@ -10,17 +10,14 @@ import {
 	WorkflowRepository,
 	WorkflowTagMappingRepository,
 } from '@n8n/db';
-import { DataTableRepository } from '@/modules/data-table/data-table.repository';
 import { Service } from '@n8n/di';
 import { PROJECT_OWNER_ROLE_SLUG } from '@n8n/permissions';
-// eslint-disable-next-line n8n-local-rules/misplaced-n8n-typeorm-import
 import { In } from '@n8n/typeorm';
+import chunk from 'lodash/chunk';
 import { Credentials, InstanceSettings } from 'n8n-core';
-import { UnexpectedError, type ICredentialDataDecryptedObject } from 'n8n-workflow';
+import { UnexpectedError } from 'n8n-workflow';
 import { rm as fsRm, writeFile as fsWriteFile } from 'node:fs/promises';
 import path from 'path';
-
-import { formatWorkflow } from '@/workflows/workflow.formatter';
 
 import {
 	SOURCE_CONTROL_CREDENTIAL_EXPORT_FOLDER,
@@ -41,19 +38,22 @@ import {
 	readFoldersFromSourceControlFile,
 	readTagAndMappingsFromSourceControlFile,
 	sourceControlFoldersExistCheck,
-	stringContainsExpression,
+	sanitizeCredentialData,
 } from './source-control-helper.ee';
 import { SourceControlScopedService } from './source-control-scoped.service';
-import { VariablesService } from '../../environments.ee/variables/variables.service.ee';
 import type { ExportResult } from './types/export-result';
 import type { ExportableCredential } from './types/exportable-credential';
 import type { DataTableResourceOwner, ExportableDataTable } from './types/exportable-data-table';
+import type { ExportableFolder } from './types/exportable-folders';
 import { ExportableProject } from './types/exportable-project';
+import { ExportableVariable } from './types/exportable-variable';
 import type { ExportableWorkflow } from './types/exportable-workflow';
 import type { RemoteResourceOwner } from './types/resource-owner';
 import type { SourceControlContext } from './types/source-control-context';
-import { ExportableVariable } from './types/exportable-variable';
-import chunk from 'lodash/chunk';
+import { VariablesService } from '../../environments.ee/variables/variables.service.ee';
+
+import { DataTableRepository } from '@/modules/data-table/data-table.repository';
+import { formatWorkflow } from '@/workflows/workflow.formatter';
 
 @Service()
 export class SourceControlExportService {
@@ -403,20 +403,15 @@ export class SourceControlExportService {
 				};
 			}
 
-			const allowedProjects =
-				await this.sourceControlScopedService.getAuthorizedProjectsFromContext(context);
-
 			const fileName = getFoldersPath(this.gitFolder);
 
-			const existingFolders = await readFoldersFromSourceControlFile(fileName);
-
-			// keep all folders that are not accessible by the current user
-			// if allowedProjects is undefined, all folders are accessible by the current user
-			const foldersToKeepUnchanged = context.hasAccessToAllProjects()
-				? []
-				: existingFolders.folders.filter((folder) => {
-						return !allowedProjects.some((project) => project.id === folder.homeProjectId);
-					});
+			let foldersToKeepUnchanged: ExportableFolder[] = [];
+			if (!context.hasAccessToAllProjects()) {
+				const existingFolders = await readFoldersFromSourceControlFile(fileName);
+				foldersToKeepUnchanged = existingFolders.folders.filter(
+					(folder) => !context.canAccessProject(folder.homeProjectId),
+				);
+			}
 
 			const newFolders = foldersToKeepUnchanged.concat(
 				...folders.map((f) => ({
@@ -515,30 +510,6 @@ export class SourceControlExportService {
 		}
 	}
 
-	private replaceCredentialData = (
-		data: ICredentialDataDecryptedObject,
-	): ICredentialDataDecryptedObject => {
-		for (const [key] of Object.entries(data)) {
-			const value = data[key];
-			try {
-				if (value === null) {
-					delete data[key]; // remove invalid null values
-				} else if (typeof value === 'object') {
-					data[key] = this.replaceCredentialData(value as ICredentialDataDecryptedObject);
-				} else if (typeof value === 'string') {
-					data[key] = stringContainsExpression(value) ? data[key] : '';
-				} else if (typeof data[key] === 'number') {
-					// TODO: leaving numbers in for now, but maybe we should remove them
-					continue;
-				}
-			} catch (error) {
-				this.logger.error(`Failed to sanitize credential data: ${(error as Error).message}`);
-				throw error;
-			}
-		}
-		return data;
-	};
-
 	async exportCredentialsToWorkFolder(candidates: SourceControlledFile[]): Promise<ExportResult> {
 		try {
 			sourceControlFoldersExistCheck([this.credentialExportFolder]);
@@ -580,18 +551,13 @@ export class SourceControlExportService {
 						};
 					}
 
-					/**
-					 * Edge case: Do not export `oauthTokenData`, so that that the
-					 * pulling instance reconnects instead of trying to use stubbed values.
-					 */
-					const credentialData = credentials.getData();
-					const { oauthTokenData, ...rest } = credentialData;
+					const sanitizedData = sanitizeCredentialData(await credentials.getData());
 
 					const stub: ExportableCredential = {
 						id,
 						name,
 						type,
-						data: this.replaceCredentialData(rest),
+						data: sanitizedData,
 						ownedBy: owner,
 						isGlobal,
 					};

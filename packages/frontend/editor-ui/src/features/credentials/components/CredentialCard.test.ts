@@ -90,12 +90,12 @@ describe('CredentialCard', () => {
 
 		const controllingId = cardActionsOpener.getAttribute('aria-controls');
 
-		await userEvent.click(cardActions);
+		await userEvent.click(cardActionsOpener);
 		const actions = document.querySelector(`#${controllingId}`);
 		if (!actions) {
 			throw new Error('Actions menu not found');
 		}
-		expect(actions).toHaveTextContent('Change owner');
+		expect(actions).toHaveTextContent('Move');
 	});
 
 	it('should set readOnly variant based on prop', () => {

@@ -22,10 +22,6 @@ import {
 	WorkflowTagMapping,
 	WorkflowTagMappingRepository,
 } from '@n8n/db';
-import { DataTableRepository } from '@/modules/data-table/data-table.repository';
-import { DataTableColumnRepository } from '@/modules/data-table/data-table-column.repository';
-import { DataTableColumn } from '@/modules/data-table/data-table-column.entity';
-import { DataTableDDLService } from '@/modules/data-table/data-table-ddl.service';
 import { Service } from '@n8n/di';
 import { PROJECT_ADMIN_ROLE_SLUG, PROJECT_OWNER_ROLE_SLUG } from '@n8n/permissions';
 import { In } from '@n8n/typeorm';
@@ -33,13 +29,25 @@ import { QueryDeepPartialEntity } from '@n8n/typeorm/query-builder/QueryPartialE
 import glob from 'fast-glob';
 import isEqual from 'lodash/isEqual';
 import { Credentials, ErrorReporter, InstanceSettings } from 'n8n-core';
-import { shouldAutoPublishWorkflow, type AutoPublishMode } from 'n8n-workflow';
-import { ensureError, jsonParse, UnexpectedError, UserError } from 'n8n-workflow';
+import type { AutoPublishMode } from 'n8n-workflow';
+import {
+	shouldAutoPublishWorkflow,
+	ensureError,
+	jsonParse,
+	UnexpectedError,
+	UserError,
+} from 'n8n-workflow';
 import { readFile as fsReadFile } from 'node:fs/promises';
 import path from 'path';
 
 import { CredentialsService } from '@/credentials/credentials.service';
 import type { IWorkflowToImport } from '@/interfaces';
+import { DataTableColumn } from '@/modules/data-table/data-table-column.entity';
+import { DataTableColumnRepository } from '@/modules/data-table/data-table-column.repository';
+import { DataTableDDLService } from '@/modules/data-table/data-table-ddl.service';
+import { DataTableRepository } from '@/modules/data-table/data-table.repository';
+import { isValidColumnName, isValidDataTableId } from '@/modules/data-table/utils/sql-utils';
+import { RedactionEnforcementService } from '@/modules/redaction/redaction-enforcement.service';
 import { isUniqueConstraintError } from '@/response-helper';
 import { TagService } from '@/services/tag.service';
 import { assertNever } from '@/utils';
@@ -56,12 +64,15 @@ import {
 	SOURCE_CONTROL_VARIABLES_EXPORT_FILE,
 	SOURCE_CONTROL_WORKFLOW_EXPORT_FOLDER,
 } from './constants';
+import { SourceControlContextFactory } from './source-control-context.factory';
 import {
 	getCredentialExportPath,
 	getDataTableExportPath,
 	getProjectExportPath,
 	getWorkflowExportPath,
 	isValidDataTableColumnType,
+	mergeRemoteCrendetialDataIntoLocalCredentialData,
+	sanitizeCredentialData,
 } from './source-control-helper.ee';
 import { SourceControlScopedService } from './source-control-scoped.service';
 import type {
@@ -82,54 +93,11 @@ import { SourceControlContext } from './types/source-control-context';
 import type { SourceControlWorkflowVersionId } from './types/source-control-workflow-version-id';
 import { VariablesService } from '../../environments.ee/variables/variables.service.ee';
 
-const findOwnerProject = (
-	owner: RemoteResourceOwner,
-	accessibleProjects: Project[],
-): Project | undefined => {
-	if (typeof owner === 'string') {
-		return accessibleProjects.find((project) =>
-			project.projectRelations.some(
-				(r) => r.role.slug === PROJECT_OWNER_ROLE_SLUG && r.user.email === owner,
-			),
-		);
+const toStatusOwner = (project: Project | undefined): StatusResourceOwner | undefined => {
+	if (project?.type) {
+		return { type: project.type, projectId: project.id, projectName: project.name };
 	}
-	if (owner.type === 'personal') {
-		return accessibleProjects.find(
-			(project) =>
-				project.type === 'personal' &&
-				project.projectRelations.some(
-					(r) => r.role.slug === PROJECT_OWNER_ROLE_SLUG && r.user.email === owner.personalEmail,
-				),
-		);
-	}
-	return accessibleProjects.find(
-		(project) => project.type === 'team' && project.id === owner.teamId,
-	);
-};
-
-const getOwnerFromProject = (remoteOwnerProject: Project): StatusResourceOwner | undefined => {
-	let owner: StatusResourceOwner | undefined = undefined;
-
-	if (remoteOwnerProject?.type === 'personal') {
-		const personalEmail = remoteOwnerProject.projectRelations?.find(
-			(r) => r.role.slug === PROJECT_OWNER_ROLE_SLUG,
-		)?.user?.email;
-
-		if (personalEmail) {
-			owner = {
-				type: 'personal',
-				projectId: remoteOwnerProject.id,
-				projectName: remoteOwnerProject.name,
-			};
-		}
-	} else if (remoteOwnerProject?.type === 'team') {
-		owner = {
-			type: 'team',
-			projectId: remoteOwnerProject.id,
-			projectName: remoteOwnerProject.name,
-		};
-	}
-	return owner;
+	return undefined;
 };
 
 @Service()
@@ -163,11 +131,13 @@ export class SourceControlImportService {
 		private readonly tagService: TagService,
 		private readonly folderRepository: FolderRepository,
 		instanceSettings: InstanceSettings,
+		private readonly sourceControlContextFactory: SourceControlContextFactory,
 		private readonly sourceControlScopedService: SourceControlScopedService,
 		private readonly workflowHistoryService: WorkflowHistoryService,
 		private readonly dataTableRepository: DataTableRepository,
 		private readonly dataTableColumnRepository: DataTableColumnRepository,
 		private readonly dataTableDDLService: DataTableDDLService,
+		private readonly redactionEnforcementService: RedactionEnforcementService,
 	) {
 		this.gitFolder = path.join(instanceSettings.n8nFolder, SOURCE_CONTROL_GIT_FOLDER);
 		this.workflowExportFolder = path.join(this.gitFolder, SOURCE_CONTROL_WORKFLOW_EXPORT_FOLDER);
@@ -187,9 +157,6 @@ export class SourceControlImportService {
 			absolute: true,
 		});
 
-		const accessibleProjects =
-			await this.sourceControlScopedService.getAuthorizedProjectsFromContext(context);
-
 		const remoteWorkflowsRead = await Promise.all(
 			remoteWorkflowFiles.map(async (file) => await this.parseWorkflowFromFile(file)),
 		);
@@ -201,12 +168,12 @@ export class SourceControlImportService {
 				}
 				return (
 					context.hasAccessToAllProjects() ||
-					(remote.owner && findOwnerProject(remote.owner, accessibleProjects))
+					(remote.owner && context.findAuthorizedProjectByOwner(remote.owner))
 				);
 			})
 			.map((remote) => {
 				const project = remote.owner
-					? findOwnerProject(remote.owner, accessibleProjects)
+					? context.findAuthorizedProjectByOwner(remote.owner)
 					: undefined;
 				return {
 					id: remote.id,
@@ -215,7 +182,7 @@ export class SourceControlImportService {
 					parentFolderId: remote.parentFolderId,
 					remoteId: remote.id,
 					filename: getWorkflowExportPath(remote.id, this.workflowExportFolder),
-					owner: project ? getOwnerFromProject(project) : undefined,
+					owner: toStatusOwner(project ?? undefined),
 					isRemoteArchived: remote.isArchived,
 				};
 			});
@@ -268,12 +235,7 @@ export class SourceControlImportService {
 			relations: {
 				parentFolder: true,
 				shared: {
-					project: {
-						projectRelations: {
-							user: true,
-							role: true,
-						},
-					},
+					project: true,
 				},
 			},
 			select: {
@@ -289,16 +251,6 @@ export class SourceControlImportService {
 						id: true,
 						name: true,
 						type: true,
-						projectRelations: {
-							// Even if the userId is not used, it seems that this is needed to get the other nested properties populated
-							userId: true,
-							role: {
-								slug: true,
-							},
-							user: {
-								email: true,
-							},
-						},
 					},
 					role: true,
 				},
@@ -320,7 +272,7 @@ export class SourceControlImportService {
 				updatedAt = isNaN(Date.parse(local.updatedAt)) ? new Date() : new Date(local.updatedAt);
 			}
 
-			const remoteOwnerProject = local.shared?.find((s) => s.role === 'workflow:owner')?.project;
+			const ownerProject = local.shared?.find((s) => s.role === 'workflow:owner')?.project;
 
 			return {
 				id: local.id,
@@ -330,7 +282,7 @@ export class SourceControlImportService {
 				parentFolderId: local.parentFolder?.id ?? null,
 				filename: getWorkflowExportPath(local.id, this.workflowExportFolder),
 				updatedAt: updatedAt.toISOString(),
-				owner: remoteOwnerProject ? getOwnerFromProject(remoteOwnerProject) : undefined,
+				owner: toStatusOwner(ownerProject),
 			};
 		});
 	}
@@ -342,9 +294,6 @@ export class SourceControlImportService {
 			cwd: this.credentialExportFolder,
 			absolute: true,
 		});
-
-		const accessibleProjects =
-			await this.sourceControlScopedService.getAuthorizedProjectsFromContext(context);
 
 		const remoteCredentialFilesRead = await Promise.all(
 			remoteCredentialFiles.map(async (file) => {
@@ -362,14 +311,13 @@ export class SourceControlImportService {
 					return false;
 				}
 				const owner = remote.ownedBy;
-				// The credential `remote` belongs not to a project, that the context has access to
 				return (
-					!owner || context.hasAccessToAllProjects() || findOwnerProject(owner, accessibleProjects)
+					!owner || context.hasAccessToAllProjects() || context.findAuthorizedProjectByOwner(owner)
 				);
 			})
 			.map((remote) => {
 				const project = remote.ownedBy
-					? findOwnerProject(remote.ownedBy, accessibleProjects)
+					? context.findAuthorizedProjectByOwner(remote.ownedBy)
 					: null;
 				return {
 					...remote,
@@ -395,34 +343,20 @@ export class SourceControlImportService {
 		const localCredentials = await this.credentialsRepository.find({
 			relations: {
 				shared: {
-					project: {
-						projectRelations: {
-							user: true,
-							role: true,
-						},
-					},
+					project: true,
 				},
 			},
 			select: {
 				id: true,
 				name: true,
 				type: true,
+				data: true,
 				isGlobal: true,
 				shared: {
 					project: {
 						id: true,
 						name: true,
 						type: true,
-						projectRelations: {
-							// Even if the userId is not used, it seems that this is needed to get the other nested properties populated
-							userId: true,
-							role: {
-								slug: true,
-							},
-							user: {
-								email: true,
-							},
-						},
 					},
 					role: true,
 				},
@@ -430,17 +364,34 @@ export class SourceControlImportService {
 			where:
 				this.sourceControlScopedService.getCredentialsInAdminProjectsFromContextFilter(context),
 		});
-		return localCredentials.map((local) => {
-			const remoteOwnerProject = local.shared?.find((s) => s.role === 'credential:owner')?.project;
-			return {
-				id: local.id,
-				name: local.name,
-				type: local.type,
-				filename: getCredentialExportPath(local.id, this.credentialExportFolder),
-				ownedBy: remoteOwnerProject ? getOwnerFromProject(remoteOwnerProject) : undefined,
-				isGlobal: local.isGlobal,
-			};
-		}) as StatusExportableCredential[];
+
+		return (await Promise.all(
+			localCredentials.map(async (local) => {
+				const ownerProject = local.shared?.find((s) => s.role === 'credential:owner')?.project;
+
+				let data: Record<string, unknown> = {};
+				try {
+					const credentials = new Credentials(
+						{ id: local.id, name: local.name },
+						local.type,
+						local.data,
+					);
+					data = sanitizeCredentialData(await credentials.getData());
+				} catch {
+					// Credential data may not be decryptable (e.g. empty or corrupted data)
+				}
+
+				return {
+					id: local.id,
+					name: local.name,
+					type: local.type,
+					data,
+					filename: getCredentialExportPath(local.id, this.credentialExportFolder),
+					ownedBy: toStatusOwner(ownerProject),
+					isGlobal: local.isGlobal,
+				};
+			}),
+		)) as StatusExportableCredential[];
 	}
 
 	async getRemoteVariablesFromFile(): Promise<ExportableVariable[]> {
@@ -563,14 +514,11 @@ export class SourceControlImportService {
 				fallbackValue: { folders: [] },
 			});
 
-			const accessibleProjects =
-				await this.sourceControlScopedService.getAuthorizedProjectsFromContext(context);
-
-			mappedFolders.folders = mappedFolders.folders.filter(
-				(folder) =>
-					context.hasAccessToAllProjects() ||
-					accessibleProjects.some((project) => project.id === folder.homeProjectId),
-			);
+			if (!context.hasAccessToAllProjects()) {
+				mappedFolders.folders = mappedFolders.folders.filter((folder) =>
+					context.canAccessProject(folder.homeProjectId),
+				);
+			}
 
 			return mappedFolders;
 		}
@@ -632,9 +580,7 @@ export class SourceControlImportService {
 	}
 
 	async getLocalTagsAndMappingsFromDb(context: SourceControlContext): Promise<ExportableTags> {
-		const localTags = await this.tagRepository.find({
-			select: ['id', 'name'],
-		});
+		const localTags = await this.tagRepository.find({ select: ['id', 'name'] });
 		const localMappings = await this.workflowTagMappingRepository.find({
 			select: ['workflowId', 'tagId'],
 			where:
@@ -673,11 +619,8 @@ export class SourceControlImportService {
 			return remoteProjects;
 		}
 
-		const accessibleProjects =
-			await this.sourceControlScopedService.getAuthorizedProjectsFromContext(context);
-
 		return remoteProjects.filter((remoteProject) => {
-			return findOwnerProject(remoteProject.owner, accessibleProjects);
+			return context.findAuthorizedProjectByOwner(remoteProject.owner);
 		});
 	}
 
@@ -796,6 +739,11 @@ export class SourceControlImportService {
 			return;
 		}
 		const existingWorkflow = existingWorkflows.find((e) => e.id === id);
+
+		this.redactionEnforcementService.assertPolicyChangeAllowed(
+			existingWorkflow?.settings?.redactionPolicy,
+			importedWorkflow.settings?.redactionPolicy,
+		);
 
 		const { shouldPublishAfterImport, publishingError } = await this.preparePublishStateForImport(
 			existingWorkflow,
@@ -975,15 +923,25 @@ export class SourceControlImportService {
 
 				const { name, type, data, id, isGlobal = false } = credential;
 				const newCredentialObject = new Credentials({ id, name }, type);
+
 				if (existingCredential?.data) {
-					newCredentialObject.data = existingCredential.data;
+					// Credential exists - merge expressions from remote while preserving local plain values
+					const existingDecrypted = new Credentials(
+						{ id: existingCredential.id, name: existingCredential.name },
+						existingCredential.type,
+						existingCredential.data,
+					);
+					const localData = await existingDecrypted.getData();
+					const mergedData = mergeRemoteCrendetialDataIntoLocalCredentialData({
+						local: localData,
+						remote: data,
+					});
+					await newCredentialObject.setData(mergedData);
 				} else {
-					/**
-					 * Edge case: Do not import `oauthTokenData`, so that that the
-					 * pulling instance reconnects instead of trying to use stubbed values.
-					 */
-					const { oauthTokenData, ...rest } = data;
-					newCredentialObject.setData(rest);
+					// This is a safe guard, in principle remote data should already be sanitized
+					// This prevents importing invalid data that should have not been synched in the first place
+					const sanitizedData = sanitizeCredentialData(data);
+					await newCredentialObject.setData(sanitizedData);
 				}
 
 				this.logger.debug(`Updating credential id ${newCredentialObject.id as string}`);
@@ -1059,7 +1017,7 @@ export class SourceControlImportService {
 
 		// Get all workflow IDs from remote files (in scope for this import)
 		// This ensures we delete mappings for workflows with zero tags
-		const context = new SourceControlContext(user);
+		const context = await this.sourceControlContextFactory.createContext(user);
 		const remoteWorkflowIds = (await this.getRemoteVersionIdsFromFiles(context)).map((wf) => wf.id);
 
 		// Include both workflows with mappings AND workflows in remote files (even with zero tags)
@@ -1255,68 +1213,100 @@ export class SourceControlImportService {
 
 		const result: { imported: string[] } = { imported: [] };
 
-		// Import each data table from its individual file
+		// Phase 1: Parse all data table files and resolve target projects upfront
+		// so we can validate name collisions before any imports happen.
+		const parsedTables: Array<{
+			dataTable: ExportableDataTable;
+			candidate: SourceControlledFile;
+			targetProjectId: string;
+		}> = [];
+
 		for (const candidate of candidates) {
+			this.logger.debug(`Parsing data table from file ${candidate.file}`);
+			let dataTable: ExportableDataTable;
 			try {
-				this.logger.debug(`Importing data table from file ${candidate.file}`);
-				const dataTable = jsonParse<ExportableDataTable>(
+				dataTable = jsonParse<ExportableDataTable>(
 					await fsReadFile(candidate.file, { encoding: 'utf8' }),
 				);
+			} catch (error) {
+				this.logger.error(`Failed to parse data table from file ${candidate.file}`, {
+					error: ensureError(error),
+				});
+				continue;
+			}
 
-				if (!dataTable || typeof dataTable !== 'object' || !dataTable.id || !dataTable.name) {
-					this.logger.warn(`Failed to parse data table from file ${candidate.file}`);
-					continue;
-				}
+			if (!dataTable || typeof dataTable !== 'object' || !dataTable.id || !dataTable.name) {
+				this.logger.warn(`Failed to parse data table from file ${candidate.file}`);
+				continue;
+			}
 
-				// Find the target project based on owner information
-				// Use the same logic as workflows/credentials to handle both team and personal projects
-				let targetProject: Project | null = null;
+			if (!isValidDataTableId(dataTable.id)) {
+				this.logger.warn(
+					`Invalid data table ID "${dataTable.id}" in file ${candidate.file}. Skipping.`,
+				);
+				continue;
+			}
 
-				if (dataTable.ownedBy) {
-					if (dataTable.ownedBy.type === 'personal') {
-						// For personal projects, try to find the user locally
-						const personalEmail = dataTable.ownedBy.personalEmail;
-						if (personalEmail) {
-							const user = await this.userRepository.findOne({ where: { email: personalEmail } });
-							if (user) {
-								targetProject = await this.projectRepository.getPersonalProjectForUserOrFail(
-									user.id,
-								);
-							} else {
-								// User doesn't exist locally - fall back to pulling user's personal project
-								this.logger.debug(
-									`User ${personalEmail} not found locally for data table ${dataTable.name}. Using pulling user's personal project as fallback.`,
-								);
-								targetProject = pullingUserPersonalProject;
-							}
-						}
-					} else if (dataTable.ownedBy.type === 'team') {
-						// For team projects, find or create
-						targetProject = await this.projectRepository.findOne({
-							where: { id: dataTable.ownedBy.teamId },
-						});
+			let targetProject: Project | null = null;
 
-						if (!targetProject) {
-							targetProject = await this.createTeamProject({
-								type: 'team',
-								teamId: dataTable.ownedBy.teamId,
-								teamName: dataTable.ownedBy.teamName,
-							});
+			if (dataTable.ownedBy) {
+				if (dataTable.ownedBy.type === 'personal') {
+					const personalEmail = dataTable.ownedBy.personalEmail;
+					if (personalEmail) {
+						const user = await this.userRepository.findOne({ where: { email: personalEmail } });
+						if (user) {
+							targetProject = await this.projectRepository.getPersonalProjectForUserOrFail(user.id);
+						} else {
+							this.logger.debug(
+								`User ${personalEmail} not found locally for data table ${dataTable.name}. Using pulling user's personal project as fallback.`,
+							);
+							targetProject = pullingUserPersonalProject;
 						}
 					}
+				} else if (dataTable.ownedBy.type === 'team') {
+					targetProject = await this.projectRepository.findOne({
+						where: { id: dataTable.ownedBy.teamId },
+					});
+
+					if (!targetProject) {
+						targetProject = await this.createTeamProject({
+							type: 'team',
+							teamId: dataTable.ownedBy.teamId,
+							teamName: dataTable.ownedBy.teamName,
+						});
+					}
 				}
+			}
 
-				// If no owner specified or owner not found, use pulling user's personal project
-				if (!targetProject) {
-					this.logger.debug(
-						`No owner specified for data table ${dataTable.name}. Using pulling user's personal project.`,
-					);
-					targetProject = pullingUserPersonalProject;
-				}
+			if (!targetProject) {
+				this.logger.debug(
+					`No owner specified for data table ${dataTable.name}. Using pulling user's personal project.`,
+				);
+				targetProject = pullingUserPersonalProject;
+			}
 
-				const targetProjectId = targetProject.id;
+			parsedTables.push({ dataTable, candidate, targetProjectId: targetProject.id });
+		}
 
-				// Check if data table already exists
+		// Phase 2: Validate all name collisions before importing anything.
+		// This prevents partial imports when a collision is detected mid-way.
+		for (const { dataTable, targetProjectId } of parsedTables) {
+			const existingByName = await this.dataTableRepository.findOne({
+				where: { name: dataTable.name, projectId: targetProjectId },
+				select: ['id'],
+			});
+			if (existingByName && existingByName.id !== dataTable.id) {
+				throw new UserError(
+					`A data table with the name <strong>${dataTable.name}</strong> already exists locally.<br />Please either rename the local data table, or the remote one with the id <strong>${dataTable.id}</strong> in the source control files.`,
+				);
+			}
+		}
+
+		// Phase 3: Import all data tables (no name collisions at this point)
+		for (const { dataTable, candidate, targetProjectId } of parsedTables) {
+			try {
+				this.logger.debug(`Importing data table from file ${candidate.file}`);
+
 				const existingDataTable = await this.dataTableRepository.findOne({
 					where: { id: dataTable.id },
 					relations: ['columns'],
@@ -1372,6 +1362,13 @@ export class SourceControlImportService {
 					// Upsert columns
 					const columnEntities = [];
 					for (const column of dataTable.columns) {
+						if (!isValidColumnName(column.name)) {
+							this.logger.warn(
+								`Invalid column name "${column.name}" in data table ${dataTable.name}. Skipping column.`,
+							);
+							continue;
+						}
+
 						if (!isValidDataTableColumnType(column.type)) {
 							this.logger.warn(
 								`Invalid column type "${column.type}" in data table ${dataTable.name}, column ${column.name}. Skipping column.`,
@@ -1387,6 +1384,20 @@ export class SourceControlImportService {
 							dataTable: { id: dataTable.id },
 						});
 						columnEntities.push(columnEntity);
+
+						// Rename columns whose name changed (same ID, different name)
+						if (!isNewTable && existingColumnIds.has(column.id)) {
+							const oldName = existingColumnNameMap.get(column.id);
+							if (oldName && oldName !== column.name) {
+								await this.dataTableDDLService.renameColumn(
+									dataTable.id,
+									oldName,
+									column.name,
+									dbType,
+									trx,
+								);
+							}
+						}
 
 						// Add new columns to existing physical table
 						if (!isNewTable && !existingColumnIds.has(column.id)) {

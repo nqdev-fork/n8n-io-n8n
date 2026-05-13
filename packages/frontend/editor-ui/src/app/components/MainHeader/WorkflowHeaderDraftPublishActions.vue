@@ -6,9 +6,11 @@ import type { IWorkflowDb } from '@/Interface';
 import type { PermissionsRecord } from '@n8n/permissions';
 import { computed, onBeforeUnmount, onMounted, ref, useTemplateRef } from 'vue';
 import {
+	VIEWS,
 	WORKFLOW_PUBLISH_MODAL_KEY,
 	WORKFLOW_HISTORY_NAME_VERSION_MODAL_KEY,
 	WORKFLOW_HISTORY_VERSION_UNPUBLISH,
+	WORKFLOW_HISTORY_PUBLISH_TIMELINE_TAB,
 	AutoSaveState,
 	EnterpriseEditionFeature,
 } from '@/app/constants';
@@ -21,15 +23,14 @@ import {
 } from '@n8n/design-system';
 import { useI18n } from '@n8n/i18n';
 import { useUIStore } from '@/app/stores/ui.store';
-import { useWorkflowsStore } from '@/app/stores/workflows.store';
 import { useSettingsStore } from '@/app/stores/settings.store';
 import { getActivatableTriggerNodes } from '@/app/utils/nodeTypesUtils';
 import { useWorkflowSaving } from '@/app/composables/useWorkflowSaving';
 import { useRouter } from 'vue-router';
-import { useWorkflowAutosaveStore } from '@/app/stores/workflowAutosave.store';
+import { useWorkflowSaveStore } from '@/app/stores/workflowSave.store';
 import {
 	getLastPublishedVersion,
-	generateVersionName,
+	generateVersionLabelFromId,
 } from '@/features/workflows/workflowHistory/utils';
 import { nodeViewEventBus } from '@/app/event-bus';
 import CollaborationPane from '@/features/collaboration/collaboration/components/CollaborationPane.vue';
@@ -43,12 +44,15 @@ import { createEventBus } from '@n8n/utils/event-bus';
 import type { WorkflowVersionFormModalEventBusEvents } from '@/features/workflows/workflowHistory/components/WorkflowVersionFormModal.vue';
 import { useWorkflowHistoryStore } from '@/features/workflows/workflowHistory/workflowHistory.store';
 import { useKeybindings } from '@/app/composables/useKeybindings';
+import {
+	useWorkflowDocumentStore,
+	createWorkflowDocumentId,
+} from '@/app/stores/workflowDocument.store';
 
 const props = defineProps<{
 	id: IWorkflowDb['id'];
 	tags: readonly string[];
 	name: IWorkflowDb['name'];
-	meta: IWorkflowDb['meta'];
 	currentFolder?: FolderShortInfo;
 	isArchived: IWorkflowDb['isArchived'];
 	isNewWorkflow: boolean;
@@ -58,7 +62,9 @@ const props = defineProps<{
 const actionsMenuRef = useTemplateRef<InstanceType<typeof ActionsDropdownMenu>>('actionsMenu');
 
 const uiStore = useUIStore();
-const workflowsStore = useWorkflowsStore();
+const workflowDocumentStore = computed(() =>
+	useWorkflowDocumentStore(createWorkflowDocumentId(props.id)),
+);
 const collaborationStore = useCollaborationStore();
 const projectStore = useProjectsStore();
 const workflowHistoryStore = useWorkflowHistoryStore();
@@ -67,7 +73,7 @@ const i18n = useI18n();
 const router = useRouter();
 const toast = useToast();
 
-const autosaveStore = useWorkflowAutosaveStore();
+const saveStore = useWorkflowSaveStore();
 const { saveCurrentWorkflow, cancelAutoSave } = useWorkflowSaving({ router });
 const workflowActivate = useWorkflowActivate();
 
@@ -76,16 +82,34 @@ const isNamedVersionsEnabled = computed(
 );
 
 const autoSaveForPublish = ref(false);
+const isSaving = ref(false);
+
+const showSaveButton = computed(() => !settingsStore.isAutosaveEnabled);
+
+const onSaveButtonClick = async () => {
+	isSaving.value = true;
+	try {
+		await saveCurrentWorkflow({});
+	} finally {
+		isSaving.value = false;
+	}
+};
 
 const importFileRef = computed(() => actionsMenuRef.value?.importFileRef);
 
 const foundTriggers = computed(() =>
-	getActivatableTriggerNodes(workflowsStore.workflowTriggerNodes),
+	getActivatableTriggerNodes(workflowDocumentStore.value.workflowTriggerNodes),
 );
 
 const containsTrigger = computed((): boolean => {
 	return foundTriggers.value.length > 0;
 });
+
+const nodesWithValidationIssues = computed(
+	() => workflowDocumentStore.value.nodesWithValidationIssues,
+);
+
+const hasNodeIssues = computed(() => workflowDocumentStore.value.hasPublishBlockingIssues);
 
 type WorkflowPublishState =
 	| 'not-published-not-eligible' // No trigger nodes or has errors
@@ -96,14 +120,14 @@ type WorkflowPublishState =
 	| 'published-invalid-trigger'; // Published but no trigger nodes
 
 const workflowPublishState = computed((): WorkflowPublishState => {
-	const hasBeenPublished = !!workflowsStore.workflow.activeVersion;
+	const hasBeenPublished = !!activeVersion.value;
 	const hasChanges =
-		workflowsStore.workflow.versionId !== workflowsStore.workflow.activeVersion?.versionId ||
-		uiStore.stateIsDirty;
+		workflowDocumentStore.value.versionId !== activeVersion.value?.versionId ||
+		uiStore.hasUnsavedWorkflowChanges;
 
 	// Not published states
 	if (!hasBeenPublished) {
-		const canPublish = containsTrigger.value && !workflowsStore.nodesIssuesExist;
+		const canPublish = containsTrigger.value && !hasNodeIssues.value;
 		return canPublish ? 'not-published-eligible' : 'not-published-not-eligible';
 	}
 
@@ -112,7 +136,7 @@ const workflowPublishState = computed((): WorkflowPublishState => {
 		return 'published-invalid-trigger';
 	}
 
-	if (workflowsStore.nodesIssuesExist) {
+	if (hasNodeIssues.value) {
 		return 'published-node-issues';
 	}
 
@@ -122,6 +146,7 @@ const workflowPublishState = computed((): WorkflowPublishState => {
 const collaborationReadOnly = computed(() => collaborationStore.shouldBeReadOnly);
 const hasUpdatePermission = computed(() => props.workflowPermissions.update);
 const hasPublishPermission = computed(() => props.workflowPermissions.publish);
+const hasUnpublishPermission = computed(() => props.workflowPermissions.unpublish);
 
 const isPersonalSpace = computed(() => projectStore.currentProject?.type === ProjectTypes.Personal);
 
@@ -131,17 +156,17 @@ const isPersonalSpace = computed(() => projectStore.currentProject?.type === Pro
  */
 const saveBeforePublish = async () => {
 	let saved = false;
-	if (autosaveStore.autoSaveState === AutoSaveState.InProgress && autosaveStore.pendingAutoSave) {
+	if (saveStore.autoSaveState === AutoSaveState.InProgress && saveStore.pendingSave) {
 		autoSaveForPublish.value = true;
 		try {
-			await autosaveStore.pendingAutoSave;
+			await saveStore.pendingSave;
 			saved = true;
 		} catch {
 			// Autosave failed, will attempt manual save below
 		} finally {
 			autoSaveForPublish.value = false;
 		}
-	} else if (autosaveStore.autoSaveState === AutoSaveState.Scheduled) {
+	} else if (saveStore.autoSaveState === AutoSaveState.Scheduled) {
 		cancelAutoSave();
 	}
 
@@ -183,7 +208,7 @@ const publishButtonConfig = computed(() => {
 				: i18n.baseText('workflows.publish.permissionDenied'),
 			showVersionInfo: false,
 		};
-		const isWorkflowPublished = !!workflowsStore.workflow.activeVersion;
+		const isWorkflowPublished = !!activeVersion.value;
 		if (isWorkflowPublished) {
 			return {
 				...defaultConfigForNoPermission,
@@ -200,15 +225,15 @@ const publishButtonConfig = computed(() => {
 	if (props.isNewWorkflow) {
 		return {
 			text: i18n.baseText('workflows.publish'),
-			enabled: containsTrigger.value && !workflowsStore.nodesIssuesExist,
+			enabled: containsTrigger.value && !hasNodeIssues.value,
 			showIndicator: false,
 			indicatorClass: '',
 			tooltip: !containsTrigger.value
 				? i18n.baseText('workflows.publishModal.noTriggerMessage')
-				: workflowsStore.nodesIssuesExist
+				: hasNodeIssues.value
 					? i18n.baseText('workflowActivator.showMessage.activeChangedNodesIssuesExistTrue.title', {
-							interpolate: { count: workflowsStore.nodesWithIssues.length },
-							adjustToNumber: workflowsStore.nodesWithIssues.length,
+							interpolate: { count: nodesWithValidationIssues.value.length },
+							adjustToNumber: nodesWithValidationIssues.value.length,
 						})
 					: '',
 			showVersionInfo: false,
@@ -225,8 +250,8 @@ const publishButtonConfig = computed(() => {
 			tooltip: !containsTrigger.value
 				? i18n.baseText('workflows.publishModal.noTriggerMessage')
 				: i18n.baseText('workflowActivator.showMessage.activeChangedNodesIssuesExistTrue.title', {
-						interpolate: { count: workflowsStore.nodesWithIssues.length },
-						adjustToNumber: workflowsStore.nodesWithIssues.length,
+						interpolate: { count: nodesWithValidationIssues.value.length },
+						adjustToNumber: nodesWithValidationIssues.value.length,
 					}),
 			showVersionInfo: false,
 		},
@@ -262,8 +287,8 @@ const publishButtonConfig = computed(() => {
 			tooltip: i18n.baseText(
 				'workflowActivator.showMessage.activeChangedNodesIssuesExistTrue.title',
 				{
-					interpolate: { count: workflowsStore.nodesWithIssues.length },
-					adjustToNumber: workflowsStore.nodesWithIssues.length,
+					interpolate: { count: nodesWithValidationIssues.value.length },
+					adjustToNumber: nodesWithValidationIssues.value.length,
 				},
 			),
 			showVersionInfo: true,
@@ -295,13 +320,13 @@ const shouldDisablePublishButton = computed(() => {
 	);
 });
 
-const activeVersion = computed(() => workflowsStore.workflow.activeVersion);
+const activeVersion = computed(() => workflowDocumentStore.value.activeVersion ?? null);
 
 const activeVersionName = computed(() => {
 	if (!activeVersion.value) {
 		return '';
 	}
-	return activeVersion.value.name ?? generateVersionName(activeVersion.value.versionId);
+	return activeVersion.value.name ?? generateVersionLabelFromId(activeVersion.value.versionId);
 });
 
 const latestPublishDate = computed(() => {
@@ -312,6 +337,7 @@ const latestPublishDate = computed(() => {
 const enum VERSION_ACTIONS {
 	PUBLISH = 'publish',
 	NAME_VERSION = 'name-version',
+	PUBLISH_TIMELINE = 'publish-timeline',
 	UNPUBLISH = 'unpublish',
 }
 
@@ -320,7 +346,7 @@ const versionMenuActions = computed<Array<ActionDropdownItem<VERSION_ACTIONS>>>(
 		{
 			id: VERSION_ACTIONS.PUBLISH,
 			label: i18n.baseText('workflows.publish'),
-			shortcut: { keys: ['P'] },
+			shortcut: { shiftKey: true, keys: ['P'] },
 			disabled: shouldDisablePublishButton.value,
 		},
 	];
@@ -330,19 +356,32 @@ const versionMenuActions = computed<Array<ActionDropdownItem<VERSION_ACTIONS>>>(
 			id: VERSION_ACTIONS.NAME_VERSION,
 			label: i18n.baseText('generic.nameVersion'),
 			shortcut: { metaKey: true, keys: ['S'] },
-			disabled: !hasUpdatePermission.value || !workflowsStore.workflow.versionId,
+			disabled: !hasUpdatePermission.value || !workflowDocumentStore.value.versionId,
 		});
 	}
 
 	actions.push({
+		id: VERSION_ACTIONS.PUBLISH_TIMELINE,
+		label: i18n.baseText('workflowHistory.action.viewTimeline'),
+	});
+
+	actions.push({
 		id: VERSION_ACTIONS.UNPUBLISH,
 		label: i18n.baseText('workflows.unpublish'),
-		disabled: !activeVersion.value || collaborationReadOnly.value || !hasPublishPermission.value,
+		disabled: !activeVersion.value || collaborationReadOnly.value || !hasUnpublishPermission.value,
 		divided: true,
 		shortcut: { metaKey: true, keys: ['U'] },
 	});
 
 	return actions;
+});
+
+const shouldDisableActionDropdown = computed(() => {
+	if (activeVersion.value) {
+		return false;
+	}
+
+	return versionMenuActions.value.every((action) => action.disabled);
 });
 
 const onNameVersion = async () => {
@@ -354,14 +393,14 @@ const onNameVersion = async () => {
 		}
 	}
 
-	const versionId = workflowsStore.workflow.versionId;
-	const versionData = workflowsStore.versionData;
+	const currentVersionId = workflowDocumentStore.value.versionId ?? '';
+	const currentVersionData = workflowDocumentStore.value.versionData;
 
 	const nameVersionEventBus = createEventBus<WorkflowVersionFormModalEventBusEvents>();
 	const modalData = ref({
-		versionId,
-		versionName: versionData?.name ?? undefined,
-		description: versionData?.description ?? undefined,
+		versionId: currentVersionId,
+		versionName: currentVersionData?.name ?? undefined,
+		description: currentVersionData?.description ?? undefined,
 		modalTitle: i18n.baseText('workflowHistory.nameVersionModal.title'),
 		submitButtonLabel: i18n.baseText('workflowHistory.nameVersionModal.confirmButton'),
 		submitting: false,
@@ -374,13 +413,13 @@ const onNameVersion = async () => {
 			modalData.value.submitting = true;
 
 			try {
-				await workflowHistoryStore.updateWorkflowHistoryVersion(props.id, versionId, {
+				await workflowHistoryStore.updateWorkflowHistoryVersion(props.id, currentVersionId, {
 					name: submitData.name,
 					description: submitData.description,
 				});
 
-				workflowsStore.setWorkflowVersionData({
-					versionId,
+				workflowDocumentStore.value.setVersionData({
+					versionId: currentVersionId,
 					name: submitData.name,
 					description: submitData.description,
 				});
@@ -443,6 +482,13 @@ const onDropdownMenuSelect = async (action: VERSION_ACTIONS) => {
 		case VERSION_ACTIONS.NAME_VERSION:
 			await onNameVersion();
 			break;
+		case VERSION_ACTIONS.PUBLISH_TIMELINE:
+			await router.push({
+				name: VIEWS.WORKFLOW_HISTORY,
+				params: { workflowId: props.id },
+				query: { tab: WORKFLOW_HISTORY_PUBLISH_TIMELINE_TAB },
+			});
+			break;
 		case VERSION_ACTIONS.UNPUBLISH:
 			onUnpublish();
 			break;
@@ -452,7 +498,7 @@ const onDropdownMenuSelect = async (action: VERSION_ACTIONS) => {
 };
 
 useKeybindings({
-	p: {
+	shift_p: {
 		disabled: () => shouldDisablePublishButton.value,
 		run: async () => {
 			await onPublishButtonClick();
@@ -462,14 +508,14 @@ useKeybindings({
 		disabled: () =>
 			!isNamedVersionsEnabled.value ||
 			!hasUpdatePermission.value ||
-			!workflowsStore.workflow.versionId,
+			!workflowDocumentStore.value.versionId,
 		run: async () => {
 			await onNameVersion();
 		},
 	},
 	'ctrl+u': {
 		disabled: () =>
-			!activeVersion.value || !hasPublishPermission.value || collaborationReadOnly.value,
+			!activeVersion.value || !hasUnpublishPermission.value || collaborationReadOnly.value,
 		run: onUnpublish,
 	},
 });
@@ -492,6 +538,18 @@ defineExpose({
 <template>
 	<div :class="$style.container">
 		<CollaborationPane v-if="!isNewWorkflow" />
+		<N8nButton
+			v-if="showSaveButton && !isArchived && workflowPermissions.update"
+			:loading="isSaving"
+			:disabled="!uiStore.stateIsDirty || collaborationReadOnly"
+			type="secondary"
+			data-test-id="workflow-save-button"
+			@click="onSaveButtonClick"
+		>
+			{{
+				uiStore.stateIsDirty ? i18n.baseText('saveButton.save') : i18n.baseText('saveButton.saved')
+			}}
+		</N8nButton>
 		<div v-if="!shouldHidePublishButton" :class="$style.publishButtonWrapper">
 			<div :class="$style.buttonGroup">
 				<N8nTooltip
@@ -517,7 +575,7 @@ defineExpose({
 						:class="$style.groupButtonLeft"
 						:loading="autoSaveForPublish"
 						:disabled="!publishButtonConfig.enabled || shouldDisablePublishButton"
-						type="secondary"
+						variant="ghost"
 						data-test-id="workflow-open-publish-modal-button"
 						@click="onPublishButtonClick"
 					>
@@ -551,8 +609,10 @@ defineExpose({
 					<template #activator>
 						<N8nIconButton
 							:class="$style.groupButtonRight"
-							type="secondary"
+							variant="ghost"
 							icon="chevron-down"
+							:disabled="shouldDisableActionDropdown"
+							:aria-label="i18n.baseText('node.moreActions')"
 							data-test-id="version-menu-button"
 						/>
 					</template>
@@ -569,7 +629,6 @@ defineExpose({
 			:name="name"
 			:tags="tags"
 			:current-folder="currentFolder"
-			:meta="meta"
 		/>
 	</div>
 </template>
@@ -591,11 +650,13 @@ defineExpose({
 .publishButtonWrapper {
 	position: relative;
 	display: inline-flex;
-	margin-right: var(--spacing--2xs);
+	margin-inline: var(--spacing--2xs);
 }
 
 .buttonGroup {
 	display: inline-flex;
+	border: var(--border);
+	border-radius: var(--radius--3xs);
 }
 
 .groupButtonLeft,
@@ -613,6 +674,7 @@ defineExpose({
 .groupButtonRight {
 	border-top-left-radius: 0;
 	border-bottom-left-radius: 0;
+	border-left: var(--border);
 }
 
 .buttonGroup:has(.groupButtonLeft:not(:disabled):hover) .groupButtonRight {
